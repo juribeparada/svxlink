@@ -51,7 +51,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #include <Module.h>
 #include <EchoLinkQso.h>
 #include <EchoLinkStationData.h>
-
+#include <Logic.h>
 
 /****************************************************************************
  *
@@ -186,8 +186,10 @@ class ModuleEchoLink : public Module
     std::vector<QsoImpl*> qsos;
     unsigned       	  max_connections;
     unsigned       	  max_qsos;
+    int               en_echotest;
     QsoImpl   	      	  *talker;
     bool      	      	  squelch_is_open;
+    bool              ch_is_receiving;
     State		  state;
     StnList		  cbc_stns;
     Async::Timer          *cbc_timer;
@@ -200,6 +202,8 @@ class ModuleEchoLink : public Module
     EchoLink::StationData last_disc_stn;
     Async::AudioSplitter  *splitter;
     Async::AudioValve 	  *listen_only_valve;
+    Async::AudioValve 	  *rx_radio_valve;
+    Async::AudioValve 	  *tx_radio_valve;
     Async::AudioSelector  *selector;
     unsigned              num_con_max;
     time_t                num_con_ttl;
@@ -207,6 +211,19 @@ class ModuleEchoLink : public Module
     NumConMap             num_con_map;
     Async::Timer          *num_con_update_timer;
     bool		  reject_conf;
+    std::string           uplink_nd;
+    std::string           admin_call;
+    std::vector<std::string>   admin_list;
+    std::string 		  call_str;
+    std::string 		  info_banner;
+    std::vector<std::string>   uplink_nodes;
+    int					  uplink_index;
+    int					  autocon_en;
+    int					  loop_det_en;
+    int					  en_rx_def;
+    std::vector<std::string>   banned_calls;
+    std::vector<std::string>   status_list;
+    Logic				  *logic_ptr;
     int   	      	  autocon_echolink_id;
     int   	      	  autocon_time;
     Async::Timer	  *autocon_timer;
@@ -262,6 +279,14 @@ class ModuleEchoLink : public Module
     void connectByNodeId(int node_id);
     void checkIdle(void);
     void checkAutoCon(Async::Timer *timer=0);
+    void nextUpLink(void);
+    bool getCallfromMsg(std::string &call, const std::string &msg);
+    void sendAdminMsg(const std::string &msg);
+    void disconnectCall(std::string &call);
+    std::string printNodeInfo(void);
+    void printHelp(void);
+    void disconnectAll(void);
+    void changeLocalName(bool is_receiving);
     bool numConCheck(const std::string &callsign);
     void numConUpdate(void);
     void replaceAll(std::string &str, const std::string &from,

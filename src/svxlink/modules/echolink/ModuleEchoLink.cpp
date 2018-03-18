@@ -32,6 +32,9 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 #include <stdio.h>
 #include <time.h>
+#include <ctype.h>
+#include <unistd.h>
+#include <sys/reboot.h>
 
 #include <algorithm>
 #include <cassert>
@@ -165,7 +168,8 @@ ModuleEchoLink::ModuleEchoLink(void *dl_handle, Logic *logic,
     autocon_timer(0), proxy(0), pty(0)
 {
   cout << "\tModule EchoLink v" MODULE_ECHOLINK_VERSION " starting...\n";
-  
+  logic_ptr = logic;
+
 } /* ModuleEchoLink */
 
 
@@ -181,7 +185,18 @@ bool ModuleEchoLink::initialize(void)
   {
     return false;
   }
+
+  uplink_index = 0;
+  autocon_en = 0;
+  loop_det_en = 0;
+  ch_is_receiving = false;
+  en_rx_def = 0;
+  en_echotest = 0;
   
+  cout << "ModuleEchoLink modified by CA6JAU, 2016-04-11" << endl;
+  
+  cout << "QSORec: " << (logic_ptr->isQsoRecEnabled() ? "TRUE" : "FALSE") << endl;
+
   vector<string> servers;
   if (!cfg().getValue(cfgName(), "SERVERS", servers))
   {
@@ -389,7 +404,33 @@ bool ModuleEchoLink::initialize(void)
   }
   
   cfg().getValue(cfgName(), "REJECT_CONF", reject_conf);
-  cfg().getValue(cfgName(), "AUTOCON_ECHOLINK_ID", autocon_echolink_id);
+  cfg().getValue(cfgName(), "UPLINK_NODES", uplink_nodes);
+  cfg().getValue(cfgName(), "ADMIN_CALLSIGN", admin_list);
+  cfg().getValue(cfgName(), "AUTOCON_EN", autocon_en);
+  cfg().getValue(cfgName(), "LOOP_DETECTOR", loop_det_en);
+  cfg().getValue(cfgName(), "INFO_BANNER", info_banner);
+  cfg().getValue(cfgName(), "STATUS_LIST", status_list);
+  cfg().getValue(cfgName(), "ENABLE_RX", en_rx_def);
+
+  // Check uplink_nodes string is not empty
+  if (uplink_nodes.empty())
+  {
+    cerr << "*** ERROR: Config variable " << cfgName() << "/UPLINK_NODES not set "
+            "or empty\n";
+    return false;
+  }
+
+  // Check admin_list string is not empty
+  if (admin_list.empty())
+  {
+    cerr << "*** ERROR: Config variable " << cfgName() << "/ADMIN_CALLSIGN not set "
+            "or empty\n";
+    return false;
+  }
+
+  admin_call = admin_list[0];
+  uplink_nd = uplink_nodes[0];
+
   int autocon_time_secs = autocon_time / 1000;
   cfg().getValue(cfgName(), "AUTOCON_TIME", autocon_time_secs);
   autocon_time = 1000 * max(autocon_time_secs, 5); // At least five seconds
@@ -437,18 +478,24 @@ bool ModuleEchoLink::initialize(void)
       mem_fun(*this, &ModuleEchoLink::onIncomingConnection));
 
     // Create audio pipe chain for audio transmitted to the remote EchoLink
-    // stations: <from core> -> Valve -> Splitter (-> QsoImpl ...)
+    // stations: <from core> -> Valve -> RX_valve -> Splitter (-> QsoImpl ...)
   listen_only_valve = new AudioValve;
   AudioSink::setHandler(listen_only_valve);
-  
+
+  rx_radio_valve = new AudioValve; 
+  listen_only_valve->registerSink(rx_radio_valve);
+
   splitter = new AudioSplitter;
-  listen_only_valve->registerSink(splitter);
+  rx_radio_valve->registerSink(splitter);
 
     // Create audio pipe chain for audio received from the remove EchoLink
-    // stations: (QsoImpl -> ) Selector -> Fifo -> <to core>
+    // stations: (QsoImpl -> ) Selector -> Fifo -> TX_valve -> <to core>
   selector = new AudioSelector;
-  AudioSource::setHandler(selector);
-  
+  tx_radio_valve = new AudioValve;
+  selector -> registerSink(tx_radio_valve);
+
+  AudioSource::setHandler(tx_radio_valve);
+
     // Periodic updates of the "watch num connects" list
   if (num_con_max > 0)
   {
@@ -457,13 +504,22 @@ bool ModuleEchoLink::initialize(void)
         mem_fun(*this, &ModuleEchoLink::numConUpdate)));
   }
 
-  if (autocon_echolink_id > 0)
+  if(!uplink_nodes.empty())
   {
-      // Initially set the timer to 15 seconds for quick activation on statup
-    autocon_timer = new Timer(15000, Timer::TYPE_PERIODIC);
-    autocon_timer->expired.connect(
-        mem_fun(*this, &ModuleEchoLink::checkAutoCon));
+      // Initially set the timer to 20 seconds for quick activation on statup
+    autocon_timer = new Timer(20000, Timer::TYPE_PERIODIC);
+    autocon_timer->expired.connect(mem_fun(*this, &ModuleEchoLink::checkAutoCon));
+
+    if(autocon_en)
+      autocon_timer->setEnable(true);
+    else
+      autocon_timer->setEnable(false);
   }
+
+  uplink_index = uplink_nodes.size() - 1;
+  nextUpLink();
+
+  rx_radio_valve->setOpen(en_rx_def);
 
   string pty_path;
   if(cfg().getValue(cfgName(), "COMMAND_PTY", pty_path))
@@ -657,8 +713,12 @@ void ModuleEchoLink::moduleCleanup(void)
   delete splitter;
   splitter = 0;
   delete listen_only_valve;
+  delete rx_radio_valve;
+  delete tx_radio_valve;
   listen_only_valve = 0;
-  
+  rx_radio_valve = 0;
+  tx_radio_valve = 0;
+
   AudioSource::clearHandler();
   delete selector;
   selector = 0;
@@ -682,6 +742,7 @@ void ModuleEchoLink::activateInit(void)
   updateEventVariables();
   state = STATE_NORMAL;
   listen_only_valve->setOpen(true);
+  tx_radio_valve->setOpen(true);
 } /* activateInit */
 
 
@@ -719,6 +780,8 @@ void ModuleEchoLink::deactivateCleanup(void)
   dbc_timer = 0;
   state = STATE_NORMAL;
   listen_only_valve->setOpen(true);
+  rx_radio_valve->setOpen(true);
+  tx_radio_valve->setOpen(true);
 } /* deactivateCleanup */
 
 
@@ -852,7 +915,13 @@ void ModuleEchoLink::squelchOpen(bool is_open)
   for (vector<QsoImpl*>::iterator it=qsos.begin(); it!=qsos.end(); ++it)
   {
     (*it)->squelchOpen(is_open);
+    if(is_open)
+      (*it)->setLocalName("[LOCAL] CONF");
+    else
+      (*it)->setLocalName(sysop_name);
   }
+
+  broadcastTalkerStatus();
 } /* squelchOpen */
 
 
@@ -1047,7 +1116,20 @@ void ModuleEchoLink::onIncomingConnection(const IpAddress& ip,
 {
   cout << "Incoming EchoLink connection from " << callsign
        << " (" << name << ") at " << ip << "\n";
+
+  // Check incoming uplink connections
+  int nd_indx;
+  int max_nodes = banned_calls.size();
   
+  for(nd_indx = 0; nd_indx < max_nodes; nd_indx++)
+  {
+    if(callsign == banned_calls[nd_indx])
+    {
+      cerr << "*** WARNING: Dropping incoming BANNED connection.\n";
+      return;
+    }
+  }
+
   if (regexec(drop_incoming_regex, callsign.c_str(), 0, 0, 0) == 0)
   {
     cerr << "*** WARNING: Dropping incoming connection due to configuration.\n";
@@ -1060,7 +1142,19 @@ void ModuleEchoLink::onIncomingConnection(const IpAddress& ip,
       	    "connections)\n";
     return;
   }
-  
+
+  if(en_echotest && (callsign != admin_call))
+  {
+    cerr << "*** WARNING: Ignoring incoming connection (ECHOTEST enabled)\n";
+    return;
+  }
+
+  if(!en_echotest && (callsign == "*ECHOTEST*"))
+  {
+    cerr << "*** WARNING: Ignoring incoming ECHOTEST connection (EchoTest disabled)\n";
+    return;  
+  }
+
   const StationData *station;
   StationData tmp_stn_data;
   if (ip.isWithinSubet(allow_ip))
@@ -1075,6 +1169,7 @@ void ModuleEchoLink::onIncomingConnection(const IpAddress& ip,
     station = dir->findCall(callsign);
     if (station == 0)
     {
+      cout << "Incoming connection is not in the list, refreshing..." << endl;
       getDirectoryList();
       return;
     }
@@ -1125,15 +1220,18 @@ void ModuleEchoLink::onIncomingConnection(const IpAddress& ip,
   }
   
     // Check if it is a station that connects very often senselessly
-  if ((num_con_max > 0) && !numConCheck(callsign))
+  if((callsign.compare(uplink_nd) != 0) && (callsign.compare(admin_call) != 0))
   {
-    qso->reject(false);
-    return;
+    if ((num_con_max > 0) && !numConCheck(callsign))
+    {
+      qso->reject(false);
+      return;
+    }
   }
 
   if ((regexec(reject_incoming_regex, callsign.c_str(), 0, 0, 0) == 0) ||
       (regexec(accept_incoming_regex, callsign.c_str(), 0, 0, 0) != 0) ||
-      (reject_conf && (name.size() > 3) &&
+      (reject_conf && (name.size() > 3) && callsign.compare(uplink_nd) &&
        (name.rfind("CONF") == (name.size()-4))))
   {
     qso->reject(true);
@@ -1214,6 +1312,12 @@ void ModuleEchoLink::onStateChange(QsoImpl *qso, Qso::State qso_state)
         autocon_timer->setTimeout(autocon_time);
       }
 
+      const StationData station = qso->stationData();
+
+      // If uplink node disconnect, connect with next uplink node
+      if(station.callsign() == uplink_nd)
+        nextUpLink();
+
       broadcastTalkerStatus();
       updateDescription();
       clientListChanged();
@@ -1240,7 +1344,7 @@ void ModuleEchoLink::onStateChange(QsoImpl *qso, Qso::State qso_state)
  * Input:     qso - The QSO object
  *    	      msg - The received message
  * Output:    None
- * Author:    Tobias Blomberg / SM0SVX
+ * Author:    Tobias Blomberg / SM0SVX, modified by CA6JAU
  * Created:   2004-05-04
  * Remarks:   
  * Bugs:      
@@ -1248,32 +1352,627 @@ void ModuleEchoLink::onStateChange(QsoImpl *qso, Qso::State qso_state)
  */
 void ModuleEchoLink::onChatMsgReceived(QsoImpl *qso, const string& msg)
 {
-  //cout << "--- EchoLink chat message received from " << qso->remoteCallsign()
-  //     << " ---" << endl
-  //     << msg << endl;
-  
+  char command_char, cmd2_char;
+  const StationData *station;
   vector<QsoImpl*>::iterator it;
-  for (it=qsos.begin(); it!=qsos.end(); ++it)
+  stringstream ss;
+  call_str.resize(20);
+  string last_info_msg, desc_str; 
+  int max_st, i, st_cnt;
+  size_t pos1;
+  bool show_ip;
+  
+  int proc_cmd = 0;
+  int adm_lst_len = admin_list.size();
+  
+  show_ip = false;
+  
+  st_cnt = 0;
+       
+  if(msg.empty())
+    return;
+  
+  for(i=0; i<adm_lst_len; i++)
   {
-    if (*it != qso)
+    if(msg.compare(0, 6, admin_list[i]) == 0)
     {
-      (*it)->sendChatData(msg);
+      admin_call = admin_list[i];
+      proc_cmd = 1;
+      break;
     }
   }
 
-    // Escape TCL control characters
-  string escaped(msg);
-  replaceAll(escaped, "\\", "\\\\");
-  replaceAll(escaped, "{", "\\{");
-  replaceAll(escaped, "}", "\\}");
-  stringstream ss;
-    // FIXME: This TCL specific code should not be here
-  ss << "chat_received [subst -nocommands -novariables {";
-  ss << escaped;
-  ss << "}]";
-  processEvent(ss.str());
+  if( proc_cmd && (!msg.compare(7, 1, ".")) && (msg.size() > 10) )
+  {
+	command_char = msg[8];
+	
+	switch(command_char)
+	{
+		case 's':
+		case 'S':
+			cout << "*** Command: printing status list..." << endl;
+			
+			max_st = status_list.size();
+			
+			if(!max_st)
+				break;
+				
+			cmd2_char = msg[9];
+			
+			switch(cmd2_char)
+			{
+				case 'i':
+				case 'I':
+				show_ip = true;
+				break;
+			}
+			
+			ss << "\nEstado de la RED:" << endl;
+						
+			for(i=0; i<max_st; i++)
+			{
+				station = dir->findCall(status_list[i]); 
+				
+				if(station)
+				{
+					st_cnt++;
+					
+					desc_str = station->description();
+					
+					pos1 = desc_str.find("(");
+					
+					if( pos1 != string::npos )
+					{
+						ss << (i+1) << ") ";
+						ss << status_list[i];
+						
+						if(show_ip)
+							ss << " " << station->ipStr();
+							
+						ss << " " << desc_str.substr(pos1) << ": " << station->statusStr() << endl;
+					}
+					else
+					{
+						ss << (i+1) << ") ";
+						ss << status_list[i];
+						
+						if(show_ip)
+							ss << " " << station->ipStr();
+							
+						ss << ": " << station->statusStr() << endl;
+					}
+				}
+				else
+				{
+					ss << (i+1) << ") " << status_list[i] << ": ------" << endl;
+				}
+			}
+			
+			ss << endl;
+			
+			ss << "Nodos online: " << st_cnt << endl;
+		   	
+			ss << "==================" << endl;
+			
+			ss << printNodeInfo();
+			
+			sendAdminMsg(ss.str());
+			
+			getDirectoryList();
+			
+			break;
+			
+		case 'v':
+		case 'V':
+			cout << "*** Command: node info..." << endl;
+			
+			if( !getCallfromMsg(call_str, msg) )
+				break;
+			
+			station = dir->findCall(call_str);
+   	
+		   	if(station == 0)
+		   	{
+		   		cout << "EchoLink callsign " << call_str << " is not in the list.\n";
+				getDirectoryList();
+				sendAdminMsg("No se encuentra nodo\n");
+				break;
+		   	}
+		   	
+		   	ss << "Informacion: " << call_str << endl; 
+		   	ss << "IP: " << station->ipStr() << endl; 
+		   	ss << "Descripcion: " << station->description() << endl; 
+		   	ss << "Estado: " << station->statusStr() << endl;
+		   	
+			sendAdminMsg(ss.str());
+			
+			break;
+			
+		case 'i':
+		case 'I':
+			cout << "*** Command: printing last uplink info..." << endl;
+			
+			for(it=qsos.begin(); it!=qsos.end(); ++it)
+			{
+				if( (*it)->currentState() != Qso::STATE_DISCONNECTED )
+				{
+					if( (*it)->remoteCallsign() == uplink_nd )
+						(*it)->lastInfoMsg(last_info_msg);
+				}
+			}
+			
+			if( last_info_msg.empty() )
+				break;
+				
+			ss << endl;
+			ss << last_info_msg;
+			ss << "==================" << endl;
+			
+			sendAdminMsg(ss.str());
+				
+			break;
+			
+		case 'l':
+		case 'L':
+			cout << "*** Command: List stations..." << endl;
+			
+			ss << "\nEstaciones conectadas:" << endl;
+			ss << "==================" << endl;
+			
+			for (it=qsos.begin(); it!=qsos.end(); ++it)
+			{
+				if( (*it)->currentState() != Qso::STATE_DISCONNECTED )
+			    {
+					ss << (*it)->remoteCallsign() << "       " << (*it)->remoteName() << "\n";
+			    }
+			}
+			
+			ss << "==================" << endl;
+			
+			ss << printNodeInfo();
+			
+			sendAdminMsg(ss.str());
+				
+			break;
+		
+		case 'd':
+		case 'D':
+			cout << "*** Command: Disconnect by callsign" << endl;
+			
+			if(!getCallfromMsg(call_str, msg))
+				break;
+			
+			disconnectCall(call_str);
+			
+			ss << "Desconectando: " << call_str << endl; 
+			sendAdminMsg(ss.str());
+			
+			break;
+			
+		case 'c':
+		case 'C':
+			cout << "*** Command: Connect by callsign" << endl;
+			
+			if(!getCallfromMsg(call_str, msg))
+				break;
+			
+			station = dir->findCall(call_str);
+   	
+		   	if(station == 0)
+		   	{
+		   		cout << "EchoLink callsign " << call_str << " is not in the list.\n";
+				getDirectoryList();
+				sendAdminMsg("No se encuentra callsign\n");
+				break;
+		   	}
+		   	
+		   	ss << "Conectando: " << call_str << endl;
+			sendAdminMsg(ss.str());
+			
+		    connectByNodeId(station->id());
+			
+			break;
+			
+		case 'n':
+		case 'N':
+			cout << "*** Command: Next uplink" << endl;
+			
+			cmd2_char = msg[9];
+			
+			switch(cmd2_char)
+			{
+				case '0':
+				uplink_index = -1;
+				break;
+			}
+			
+			disconnectCall(uplink_nd);
+				
+			ss << "Conectando: " << uplink_nd << endl;
+			sendAdminMsg(ss.str());
+			
+			break;
+			
+		case 'a':
+		case 'A':
+		
+			if(autocon_timer->isEnabled())
+			{
+				autocon_timer->setEnable(false);
+				
+				cout << "*** Command: Uplink autocon OFF" << endl;
+				sendAdminMsg("Uplink autocon: OFF\n");
+				
+				disconnectCall(uplink_nd);
+			}
+			else
+			{
+				uplink_index = 0;
+				uplink_nd = uplink_nodes[0];
+				autocon_timer->setEnable(true);
+				
+				cout << "*** Command: Uplink autocon ON" << endl;
+				sendAdminMsg("Uplink autocon: ON\n");
+			}
+			
+			break;
+			
+		case 'w':
+		case 'W':
+			cout << "*** Command: New uplink connection" << endl;
+			
+			if( !getCallfromMsg(call_str, msg) )
+				break;
+	
+			uplink_nodes.push_back(call_str);
+			
+			uplink_index = uplink_nodes.size() - 2;
+			
+			disconnectCall(uplink_nd);
+			
+			cout << "New temporary uplink node: " << uplink_nd << endl;
+			
+			ss << "Conectando uplink: " << uplink_nd << endl; 
+			sendAdminMsg(ss.str());
+			
+			break;
+			
+		case 'b':
+		case 'B':
+			cout << "*** Command: Ban callsign" << endl;
+			
+			if( !getCallfromMsg(call_str, msg) )
+				break;
+				
+			disconnectCall(call_str);
+			
+			banned_calls.push_back(call_str);
+			
+			ss << "Baneado: " << call_str << endl; 
+			sendAdminMsg(ss.str());
+			
+			break;
+			
+		case 'x':
+		case 'X':
+			cout << "*** Command: REBOOT!!!" << endl;
+			sendAdminMsg("Reiniciando...\n");
+			
+			sync();
+			reboot(RB_AUTOBOOT);
+			break;
+			
+		case 'r':
+		case 'R':
+			if(rx_radio_valve->isOpen())
+			{
+				rx_radio_valve->setOpen(false);
+				cout << "*** Command: RX Radio OFF" << endl;
+				sendAdminMsg("RX Radio: OFF\n");
+			}
+			else
+			{
+				rx_radio_valve->setOpen(true);
+				cout << "*** Command: RX Radio ON" << endl;
+				sendAdminMsg("RX Radio: ON\n");
+			}
+
+			break;
+			
+		case 'g':
+		case 'G':
+			if(logic_ptr->isQsoRecEnabled())
+			{
+				logic_ptr->QsoRecEnable(false);
+				cout << "*** Command: Grabadora OFF" << endl;
+				sendAdminMsg("Grabadora: OFF\n");
+			}
+			else
+			{
+				logic_ptr->QsoRecEnable(true);
+				cout << "*** Command: Grabadora ON" << endl;
+				sendAdminMsg("Grabadora: ON\n");
+			}
+
+			break;
+			
+		case 'e':
+		case 'E':
+			if(en_echotest)
+			{
+				disconnectAll();
+				
+				uplink_index = 0;
+				uplink_nd = uplink_nodes[0];
+				autocon_timer->setEnable(true);
+				
+				cout << "*** Command: EchoTest OFF" << endl;
+				sendAdminMsg("EchoTest: OFF\n");
+				
+				en_echotest = 0;
+			}
+			else
+			{	
+				autocon_timer->setEnable(false);
+				
+				cout << "*** Command: EchoTest ON" << endl;
+				sendAdminMsg("EchoTest: ON\n");
+				
+				disconnectAll();
+				
+				connectByNodeId(9999);
+				
+				en_echotest = 1;
+			}
+
+			break;
+			
+		case 't':
+		case 'T':
+			if(tx_radio_valve->isOpen())
+			{
+				tx_radio_valve->setOpen(false);
+				cout << "*** Command: TX Radio OFF" << endl;
+				sendAdminMsg("TX Radio: OFF\n");
+			}
+			else
+			{
+				tx_radio_valve->setOpen(true);
+				cout << "*** Command: TX Radio ON" << endl;
+				sendAdminMsg("TX Radio: ON\n");
+			}
+			
+			break;
+			
+		case 'p':
+		case 'P':
+		
+			cout << "*** Command: playing local beacon..." << endl;
+
+			sendAdminMsg("Transmitiendo baliza local\n");
+			
+			ss << "play_local_beacon";
+			processEvent(ss.str());
+		
+			break;
+			
+		case '?':
+		
+			printHelp();
+			
+			break;
+			
+		default :
+			cout << "*** Command not found" << endl;
+
+			sendAdminMsg("Comando incorrecto\n");
+			
+			printHelp();
+	}
+	
+  }
+  else
+  {
+    if(msg.size() > 128)
+      return;
+
+    for (it=qsos.begin(); it!=qsos.end(); ++it)
+    {
+      if (*it != qso)
+        (*it)->sendChatData(msg);
+    }
+  }
+
 } /* onChatMsgReceived */
 
+void ModuleEchoLink::printHelp(void)
+{
+  stringstream ss;
+  
+  ss << "\nAyuda (- es callsign, use barra espaciadora para anular comando):\n\n";
+  
+  ss << ".s : estado red\n";
+  
+  ss << ".si : estado red (con IPs)\n";
+  
+  ss << ".v- : ver informacion de nodo\n";
+  
+  ss << ".i : info uplink\n";
+  
+  ss << ".l : nodos conectados\n";  
+  
+  ss << ".c- : conectar\n";
+  
+  ss << ".d- : desconectar\n";
+  
+  ss << ".n : siguiente uplink\n";  
+
+  ss << ".n0 : conectar primer uplink\n"; 
+  
+  ss << ".a : uplink autoconexion ON/OFF\n";
+  
+  ss << ".w- : conectar nuevo uplink\n";  
+  
+  ss << ".b- : banear nodo\n";
+  
+  ss << ".r : RX radio ON/OFF\n";
+  
+  ss << ".t : TX radio ON/OFF\n";
+  
+  ss << ".g : Grabadora ON/OFF\n";
+  
+  ss << ".e : EchoTest ON/OFF\n";
+  
+  ss << ".p : transmitir baliza local\n";
+  
+  ss << ".x : reiniciar\n";
+  
+  ss << ".? : ver ayuda\n\n";
+  
+  ss << "Ejemplo conectar a AB1XYZ-L:\n";
+  
+  ss << ".cab1xyz-l\n\n";
+  
+  ss << "==================" << endl;
+  
+  ss << printNodeInfo();
+  
+  sendAdminMsg(ss.str());
+  
+}
+
+string ModuleEchoLink::printNodeInfo(void)
+{
+	stringstream ss;
+	int cnt = 0;
+	int i;
+	vector<QsoImpl*>::iterator it;
+	string uplink_status;
+
+	ss << "Uplink actual: " << uplink_nd << endl;
+	
+	for (it=qsos.begin(); it!=qsos.end(); ++it)
+	{
+		if( (*it)->remoteCallsign() == uplink_nd )
+		{
+			switch ((*it)->currentState())
+			{
+			case Qso::STATE_DISCONNECTED:
+			  uplink_status = "DESCONECTADO";
+			  break;
+			case Qso::STATE_CONNECTING:
+			  uplink_status = "CONECTANDO...";
+			  break;
+			case Qso::STATE_CONNECTED:
+			  uplink_status = "CONECTADO";   
+			  break;
+			case Qso::STATE_BYE_RECEIVED:
+			  uplink_status = "BYE_RECEIVED";
+			  break;
+			default:
+			  uplink_status = "?";
+			  break;
+			}
+		    
+		    break;
+		}
+	}
+	
+	ss << "Estado uplink: " << uplink_status << endl;
+	
+	if(talker != 0)
+		ss << "Nodo activo: " << talker->remoteCallsign() << " (" << talker->remoteName() << ")" << endl;
+	else
+		ss << "Nodo activo: Ninguno" << endl;
+		
+	ss << "Uplink autocon: " << (autocon_timer->isEnabled() ? "ON" : "OFF") << endl;
+		
+	cnt = banned_calls.size();
+	
+	if(cnt)
+	{
+		ss << "Baneados:";
+		for(i=0; i<cnt; i++)
+			ss << " " << banned_calls[i];
+			
+		ss << endl;
+	}
+
+	ss << "RX Radio: " << (rx_radio_valve->isOpen() ? "ON" : "OFF") << endl;
+	ss << "TX Radio: " << (tx_radio_valve->isOpen() ? "ON" : "OFF") << endl;
+	ss << "EchoTest: " << (en_echotest ? "ON" : "OFF") << endl;
+	ss << "Grabadora: " << (logic_ptr->isQsoRecEnabled() ? "ON" : "OFF") << endl;
+	ss << "Squelch: " << (squelch_is_open ? "Abierto" : "Cerrado") << endl;
+	ss << "Audio: " << (ch_is_receiving ? "Recibiendo..." : "Reposo") << endl;
+
+	ss << "==================" << endl;
+	
+	return ss.str();
+}
+
+void ModuleEchoLink::disconnectCall(std::string &call)
+{
+	vector<QsoImpl*>::iterator it;
+	
+	for(it=qsos.begin(); it!=qsos.end(); ++it)
+	{
+		if( (*it)->currentState() != Qso::STATE_DISCONNECTED )
+	    {
+	    	if( (*it)->remoteCallsign() == call )
+	    		(*it)->disconnect();
+	    }
+	}
+}
+
+void ModuleEchoLink::disconnectAll(void)
+{
+	vector<QsoImpl*>::iterator it;
+	
+	for(it=qsos.begin(); it!=qsos.end(); ++it)
+	{
+		if( (*it)->currentState() != Qso::STATE_DISCONNECTED )
+	    {
+	    	if( (*it)->remoteCallsign() != admin_call )
+	    		(*it)->disconnect();
+	    }
+	}
+}
+
+bool ModuleEchoLink::getCallfromMsg(string &call_str, const string &msg)
+{
+	int i;
+	  
+	int len = msg.size();
+	
+	if(len>19)
+	{
+		cout << "*** Callsign string too long ..." << endl;
+		sendAdminMsg("Callsign muy largo!\n");
+		printHelp();
+		return false;
+	}
+	
+	for(i=9;i<(len-2);i++)
+		call_str[i-9] = toupper(msg[i]);
+		
+	call_str.resize(i-9);
+		
+	return true;
+}
+
+void ModuleEchoLink::sendAdminMsg(const std::string &msg)
+{
+	vector<QsoImpl*>::iterator it;
+	
+	for(it=qsos.begin(); it!=qsos.end(); ++it)
+	{
+		if( (*it)->currentState() != Qso::STATE_DISCONNECTED )
+	    {
+	    	if( (*it)->remoteCallsign() == admin_call )
+	    		(*it)->sendChatData(msg);
+	    }
+	}
+}
 
 /*
  *----------------------------------------------------------------------------
@@ -1283,28 +1982,45 @@ void ModuleEchoLink::onChatMsgReceived(QsoImpl *qso, const string& msg)
  * Input:     qso - The QSO object
  *    	      msg - The received message
  * Output:    None
- * Author:    Tobias Blomberg / SM0SVX
- * Created:   2017-05-13
+ * Author:    Andy Uribe / CA6JAU
+ * Created:   2016-04-11
  * Remarks:
  * Bugs:
  *----------------------------------------------------------------------------
  */
 void ModuleEchoLink::onInfoMsgReceived(QsoImpl *qso, const string& msg)
 {
-    // Escape TCL control characters
-  string escaped(msg);
-  replaceAll(escaped, "\\", "\\\\");
-  replaceAll(escaped, "{", "\\{");
-  replaceAll(escaped, "}", "\\}");
+  size_t found1, found2;
   stringstream ss;
-    // FIXME: This TCL specific code should not be here
-  ss << "info_received \"" << qso->remoteCallsign()
-     << "\" [subst -nocommands -novariables {";
-  ss << escaped;
-  ss << "}]";
-  processEvent(ss.str());
-} /* onInfoMsgReceived */
+  vector<QsoImpl*>::iterator it;
 
+  stringstream xs(msg);
+  string tok;
+
+  if( (qso->remoteCallsign() != uplink_nd) && loop_det_en)
+  {
+    while(getline(xs, tok, '\n')) {
+      found1 = tok.find(uplink_nd);
+      found2 = tok.find(mycall);
+
+      if( (found1 != string::npos) && (found2 == string::npos) )
+      {
+        cout << "*** Loop detected: " << qso->remoteCallsign() << endl;
+        qso->disconnect();
+
+        ss << qso->remoteCallsign() << " ya conectado a la red" << endl; 
+
+        for (it=qsos.begin(); it!=qsos.end(); ++it)
+        {
+          if (*it != qso)
+            (*it)->sendChatData(ss.str());
+        }
+        break;
+     }
+    }
+
+  }
+}
 
 /*
  *----------------------------------------------------------------------------
@@ -1331,19 +2047,31 @@ void ModuleEchoLink::onIsReceiving(bool is_receiving, QsoImpl *qso)
      << " " << qso->remoteCallsign();
   processEvent(ss.str());
 
+  ch_is_receiving = is_receiving;
+
   if ((talker == 0) && is_receiving)
   {
+    string name = qso->remoteName();
+    string callsign = qso->remoteCallsign();
+
+    if((en_echotest==0) && (callsign == "*ECHOTEST*"))
+    {
+      cerr << "*** WARNING: Dropping ECHOTEST connection (EchoTest disabled)\n";
+      qso->disconnect();
+      return;  
+    }
+
     if (reject_conf)
     {
-      string name = qso->remoteName();
-      if ((name.size() > 3) && (name.rfind("CONF") == (name.size()-4)))
+      if ((name.size() > 3) && callsign.compare(uplink_nd) && (name.rfind("CONF") == (name.size()-4)))
       {
-	qso->sendChatData("Connects from a conference are not allowed");
-	qso->disconnect();
-	return;
+        qso->sendChatData("Connects from a conference are not allowed");
+        qso->disconnect();
+        return;
       }
     }
     talker = qso;
+    changeLocalName(true);
     broadcastTalkerStatus();
   }
   
@@ -1356,11 +2084,43 @@ void ModuleEchoLink::onIsReceiving(bool is_receiving, QsoImpl *qso)
       {
       	is_receiving = true;
       }
+      changeLocalName(is_receiving);
       broadcastTalkerStatus();
     }
   }
+  
+  changeLocalName(is_receiving);
+  
 } /* onIsReceiving */
 
+// Changing local sysop_name when a station is talking
+void ModuleEchoLink::changeLocalName(bool is_receiving)
+{
+  vector<QsoImpl*>::iterator it;
+  stringstream xs;
+
+  if(is_receiving)
+  {
+    if(talker != 0)
+    {
+      xs << "[" << talker->remoteCallsign() << "]" << " CONF";
+      for(it=qsos.begin(); it!=qsos.end(); ++it)
+      {
+        if( (*it)->currentState() != Qso::STATE_DISCONNECTED )
+          (*it)->setLocalName(xs.str());
+      }
+    }
+  }
+  else
+  {
+    for(it=qsos.begin(); it!=qsos.end(); ++it)
+    {
+      if( (*it)->currentState() != Qso::STATE_DISCONNECTED )
+        (*it)->setLocalName(sysop_name);
+    }
+  }
+
+}
 
 void ModuleEchoLink::destroyQsoObject(QsoImpl *qso)
 {
@@ -1469,8 +2229,9 @@ void ModuleEchoLink::createOutgoingConnection(const StationData &station)
     return;
   }
 
-  cout << "Connecting to " << station.callsign() << " (" << station.id()
-       << ")\n";
+  if(station.callsign() != uplink_nd)
+    cout << "Connecting to " << station.callsign() << " (" << station.id()
+         << ")\n";
   
   QsoImpl *qso = 0;
   
@@ -1481,12 +2242,15 @@ void ModuleEchoLink::createOutgoingConnection(const StationData &station)
     {
       if ((*it)->currentState() != Qso::STATE_DISCONNECTED)
       {
-	cerr << "*** WARNING: Already connected to " << station.callsign()
-      	     << ". Ignoring connect request.\n";
-	stringstream ss;
-	ss << "already_connected_to " << station.callsign();
-	processEvent(ss.str());
-	return;
+        if(station.callsign() == uplink_nd)
+          return;
+
+        cerr << "*** WARNING: Already connected to " << station.callsign()
+             << ". Ignoring connect request.\n";
+        stringstream ss;
+        ss << "already_connected_to " << station.callsign();
+        processEvent(ss.str());
+        return;
       }
       qso = *it;
       qsos.erase(it);
@@ -1593,7 +2357,12 @@ void ModuleEchoLink::broadcastTalkerStatus(void)
   
   stringstream msg;
   msg << "SvxLink " << SVXLINK_VERSION << " - " << mycall
-      << " (" << numConnectedStations() << ")\n\n";
+      << " (" << numConnectedStations() << ")\n";
+
+  if(info_banner.size())
+    msg << info_banner;
+
+  msg << endl;
 
   if (squelch_is_open && listen_only_valve->isOpen())
   {
@@ -1603,8 +2372,16 @@ void ModuleEchoLink::broadcastTalkerStatus(void)
   {
     if (talker != 0)
     {
-      msg << "> " << talker->remoteCallsign() << "         "
-      	  << talker->remoteName() << "\n\n";
+      if(talker->remoteCallsign() == uplink_nd)
+      {
+        msg << "> " << talker->remoteCallsign() << " (U)     "
+            << talker->remoteName() << "\n\n";
+      }
+      else
+      {
+        msg << "> " << talker->remoteCallsign() << "         "
+            << talker->remoteName() << "\n\n";
+      }
     }
     msg << mycall << "         ";
     if (!listen_only_valve->isOpen())
@@ -1623,8 +2400,16 @@ void ModuleEchoLink::broadcastTalkerStatus(void)
     }
     if ((*it != talker) || squelch_is_open)
     {
-      msg << (*it)->remoteCallsign() << "         "
-      	  << (*it)->remoteName() << "\n";
+      if((*it)->remoteCallsign() == uplink_nd)
+      {
+        msg << (*it)->remoteCallsign() << " (U)     "
+            << (*it)->remoteName() << "\n";
+      }
+      else
+      {
+        msg << (*it)->remoteCallsign() << "         "
+            << (*it)->remoteName() << "\n";
+      }
     }
   }
   
@@ -2105,7 +2890,7 @@ void ModuleEchoLink::checkIdle(void)
  * Purpose:   Initiate the process of connecting to autocon_echolink_id
  * Input:     timer - the timer instance (not used)
  * Output:    None
- * Author:    Robbie De Lise / ON4SAX
+ * Author:    Robbie De Lise / ON4SAX, modified by CA6JAU
  * Created:   2010-07-30
  * Remarks:
  * Bugs:
@@ -2113,19 +2898,36 @@ void ModuleEchoLink::checkIdle(void)
  */
 void ModuleEchoLink::checkAutoCon(Timer *) 
 {
-    // Only try to activate the link if we are online and not
-    // currently connected to any station. A connection will only be attempted
-    // if module activation is successful.
-  if ((dir->status() == StationData::STAT_ONLINE)
-      && (numConnectedStations() == 0)
-      && activateMe())
+  if ((dir->status() == StationData::STAT_ONLINE) && activateMe())
   {
-    cout << "ModuleEchoLink: Trying autoconnect to "
-         << autocon_echolink_id << "\n";
+    const StationData *station = dir->findCall(uplink_nd);   
+
+    if(station == 0)
+    {
+      cout << "EchoLink callsign " << uplink_nd << " is not in the list.\n";
+      getDirectoryList();
+      nextUpLink();
+      return;
+    }
+
+    autocon_echolink_id = station->id();
     connectByNodeId(autocon_echolink_id);
   }
 } /* ModuleEchoLink::checkAutoCon */
 
+void ModuleEchoLink::nextUpLink()
+{
+  int max_nodes = uplink_nodes.size();
+
+  uplink_index++;
+
+  if(uplink_index >= max_nodes)
+    uplink_index = 0;
+
+  uplink_nd = uplink_nodes[uplink_index];
+
+  cout << "Changing uplink node to: " << uplink_nd << " (Total: " << max_nodes << " uplink nodes)\n";
+}
 
 bool ModuleEchoLink::numConCheck(const std::string &callsign)
 {

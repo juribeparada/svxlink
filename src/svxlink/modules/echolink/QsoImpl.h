@@ -226,6 +226,10 @@ class QsoImpl
 
     const std::string& remoteName(void) const { return m_qso.remoteName(); }
     
+    void setLocalName(const std::string& name) { m_qso.setLocalName(name); }
+
+    void lastInfoMsg(std::string& msg) { msg = last_info_msg; }
+
     void setRemoteCallsign(const std::string& call)
     {
       m_qso.setRemoteCallsign(call);

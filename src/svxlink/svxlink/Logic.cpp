@@ -761,6 +761,24 @@ void Logic::recordStop(void)
   recorder = 0;
 } /* Logic::recordStop */
 
+void Logic::qsoRecEnable(bool enable)
+{
+	if(qso_recorder)
+		qso_recorder->setEnabled(enable);
+} /* Logic::qsoRecEnable */
+
+bool Logic::isQsoRecEnabled(void)
+{
+	if(qso_recorder)
+	{
+		if(qso_recorder->isEnabled())
+			return true;
+		else
+			return false;		
+	}
+	else
+		return false;
+} /* Logic::isQsoRecEnabled */
 
 void Logic::injectDtmf(const std::string& digits, int len)
 {
@@ -1324,7 +1342,7 @@ void Logic::processCommand(const std::string &cmd, bool force_core_cmd)
       processCommand(rest, true);
     }
   }
-  else if (cmd[0] == 'D')
+  else if (cmd[0] == 'C')
   {
     processMacroCmd(cmd);
   }
@@ -1369,7 +1387,7 @@ void Logic::processCommand(const std::string &cmd, bool force_core_cmd)
 void Logic::processMacroCmd(const string& macro_cmd)
 {
   cout << name() << ": Processing macro command: " << macro_cmd << "...\n";
-  assert(!macro_cmd.empty() && (macro_cmd[0] == 'D'));
+  assert(!macro_cmd.empty() && (macro_cmd[0] == 'C'));
   string cmd(macro_cmd, 1);
   if (cmd.empty())
   {
