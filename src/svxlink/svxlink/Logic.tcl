@@ -132,10 +132,12 @@ proc send_short_ident {{hour -1} {minute -1}} {
   global mycall;
   variable CFG_TYPE;
 
-  spellWord $mycall;
-  if {$CFG_TYPE == "Repeater"} {
-    playMsg "Core" "repeater";
-  }
+  CW::play $mycall;
+
+#  spellWord $mycall;
+#  if {$CFG_TYPE == "Repeater"} {
+#    playMsg "Core" "repeater";
+#  }
   playSilence 500;
 }
 
@@ -182,15 +184,19 @@ proc send_long_ident {hour minute} {
 # expired.
 #
 proc send_rgr_sound {} {
-  variable sql_rx_id
+#  variable sql_rx_id;
 
-  if {$sql_rx_id != "?"} {
-    # 150 CPM, 1000 Hz, -4 dBFS
-    CW::play $sql_rx_id 150 1000 -4
-  } else {
-    playTone 440 500 100
-  }
-  playSilence 100
+#  playTone 440 500 100;
+#  playSilence 200;
+
+#  for {set i 0} {$i < $sql_rx_id} {incr i 1} {
+#    playTone 880 500 50;
+#    playSilence 50;
+#  }
+#  playSilence 100;
+
+   CW::play "L";
+   playSilence 200;
 }
 
 

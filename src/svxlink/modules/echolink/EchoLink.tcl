@@ -224,9 +224,9 @@ proc connecting_to {call} {
 # Executed when an EchoLink connection has been terminated
 #
 proc disconnected {call} {
-  spellEchoLinkCallsign $call;
-  playMsg "disconnected";
-  playSilence 500;
+#  spellEchoLinkCallsign $call;
+#  playMsg "disconnected";
+#  playSilence 500;
 }
 
 
@@ -234,9 +234,9 @@ proc disconnected {call} {
 # Executed when an incoming EchoLink connection has been accepted.
 #
 proc remote_connected {call} {
-  playMsg "connected";
-  spellEchoLinkCallsign $call;
-  playSilence 500;
+#  playMsg "connected";
+#  spellEchoLinkCallsign $call;
+#  playSilence 500;
 }
 
 
@@ -465,9 +465,9 @@ proc reject_outgoing_connection {call} {
 #
 #
 proc is_receiving {rx call} {
-  if {$rx == 0} {
-    playTone 1000 100 100;
-  }
+#  if {$rx == 0} {
+#    playTone 1000 100 100;
+#  }
 }
 
 
@@ -509,8 +509,8 @@ proc info_received {call msg} {
 # Executed when an incoming connection is accepted
 #
 proc remote_greeting {call} {
-  playSilence 1000;
-  playMsg "greeting";
+#  playSilence 1000;
+#  playMsg "greeting";
 }
 
 
