@@ -1683,13 +1683,13 @@ void ModuleEchoLink::onChatMsgReceived(QsoImpl *qso, const string& msg)
 		case 'G':
 			if(logic_ptr->isQsoRecEnabled())
 			{
-				logic_ptr->QsoRecEnable(false);
+				logic_ptr->qsoRecEnable(false);
 				cout << "*** Command: Grabadora OFF" << endl;
 				sendAdminMsg("Grabadora: OFF\n");
 			}
 			else
 			{
-				logic_ptr->QsoRecEnable(true);
+				logic_ptr->qsoRecEnable(true);
 				cout << "*** Command: Grabadora ON" << endl;
 				sendAdminMsg("Grabadora: ON\n");
 			}
